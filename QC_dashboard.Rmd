@@ -1,0 +1,1185 @@
+---
+title: "SFCN Coral QC Checks"
+author: "South Florida/Caribbean Network"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: false
+    toc_depth: 3
+    toc_float: true
+    collapsed: false
+    theme: spacelab
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+###
+#####
+#########
+
+#Parameters to update if needed to change the date range or data that is used
+
+#Enter in any year of interest, or leave blank to process all years
+StartYear <- ""
+EndYear <- ""
+
+#Customize the parks to analyze
+ParkList <- c("BISC","BUIS","DRTO","SARI","VIIS")
+#ParkList <- c("VIIS")
+
+#Should the server disease photo check be done? This takes several extra minutes to run over the VPN
+DiseasePhotoCheck <- TRUE
+
+#Enter the date of the database snapshot to load
+SnapshotDate <- "20210317"
+#Note that these snapshot (RDS) files are created by a separate R script. That script will only succeed for those with read permission to the SQL database and the appropriate ODBC connection. That script is named Coral_SQL_data_import.R in the "..\analysis\R\SQL_download" folder. When run it will automatically download all coral data and save it with a date stamp that is referenced by SnapshotDate.
+
+#########
+#####
+###
+
+#install packages if they don't exist
+list.of.packages <- c("tidyverse", "DT","kableExtra","formattable","plotly","shiny","scales","viridis","stringr","lubridate","data.table")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages, repos='http://cran.us.r-project.org')
+
+#load packages
+library(tidyverse)    #data wrangling
+library(DT)           #dynamic tables
+library(kableExtra)   #second table option
+library(formattable)  #third table option
+library(plotly)       #interactive plots
+library(scales)       #customize plot axis
+library(viridis)      #continuous color ramps
+library(stringr)      #string operations
+library(data.table)   #data table operations
+library(lubridate)    #working with dates
+
+#set working directory to current source
+#setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+#function to display a DT table with download options; used by many of the checks below, so this is a single place
+#to edit the look and feel of most tables
+WriteDataTable <- function(DataSet) {
+  if (nrow(DataSet) == 0) {
+    cat('\n***<font color="green">This check returned no results.</font>***\n')
+  }
+  else {
+    DT::renderDataTable({DataSet},
+                extensions = 'Buttons',
+                options = list( 
+                  dom = "Blfrtip",
+                  buttons = 
+                    list("copy", list(
+                      extend = "collection",
+                      buttons = c("csv", "excel"),
+                      text = "Download"
+                    )) # end of buttons customization
+                   
+                   # customize the length menu
+                  , lengthMenu = list( c(10, 25,50,100, -1) # declare values
+                                       , c(10, 25,50,100, "All") # declare titles
+                  ) # end of lengthMenu customization
+                  , pageLength = 10
+                ))   
+  }
+}
+
+#function to calculate the interquartile range (IQR) and return either the high or low range for outliers
+ReturnIQR <- function(ValueType,DataSet) {
+  #calculate statistical outliers: below Q1-(1.5)IQR or above Q3+(1.5)IQR
+  Q <- quantile(DataSet, probs=c(.25, .75), na.rm = FALSE)
+  iqr <- IQR(DataSet)
+  
+  if(ValueType == "high") {
+    up <-  Q[2]+1.5*iqr # Upper Range 
+    return(up)
+  }
+  else if(ValueType == "low") {
+    low<- Q[1]-1.5*iqr # Lower Range 
+    return(low)
+  }
+  
+  #clean up a few objects we no longer need
+  remove(up,low,iqr,Q)
+}
+
+#read in the RDS datasets
+video <- readRDS(paste0('data\\',SnapshotDate,'_SFCN_Coral_Video.rds'))  
+species <- readRDS(paste0('data\\',SnapshotDate,'_SFCN_Coral_Species.rds')) 
+disease <- readRDS(paste0('data\\', SnapshotDate, '_SFCN_Coral_Disease.rds'))
+cdr <- readRDS(paste0('data\\',SnapshotDate,'_SFCN_Coral_CDR.rds'))
+site_visits <- readRDS(paste0('data\\',SnapshotDate,'_SFCN_Coral_SiteVisitsVideo.rds'))
+
+#check to ensure StartYear isn't a valid year; if not, use the min and max of the entire dataset
+if (nchar(StartYear) != 4) {
+  StartYear <- min(video$Year)
+  EndYear <- max(video$Year)
+}
+
+#filter down to just the years of interest
+video <- filter(video,Year >= StartYear, Year <= EndYear)
+species <- filter(species,Year >= StartYear, Year <= EndYear)
+disease <- filter(disease,Year >= StartYear, Year <= EndYear)
+cdr <- filter(cdr,Year >= StartYear, Year <= EndYear)
+site_visits <- filter(site_visits,Year >= StartYear, Year <= EndYear)
+
+#filter down to the parks of interest
+video <- filter(video,Park %in% ParkList)
+species <- filter(species,Park %in% ParkList)
+disease <- filter(disease,Park %in% ParkList)
+cdr <- filter(cdr,Park %in% ParkList)
+site_visits <- filter(site_visits,Park %in% ParkList)
+
+```
+
+### QC file processed for `r StartYear` to `r EndYear` for `r ParkList`
+
+This QC tool was developed as an R Markdown document by Judd Patterson and Mario Londoño in 2020. It includes data exported from the database on `r format(as.Date(SnapshotDate,"%Y%m%d"),format="%m/%d/%Y")` Within the database individual transects can be set to 'ExcludeObservation' = TRUE if there is a major data quality issue. Those excluded observations are not passed to this tool. The video data only includes records that have a Project of 'CoralVideo' and a Purpose of 'Annual' or 'Episodic'.
+
+<br>
+
+<center>
+
+![](SFCN_logo.png)
+
+<br>
+
+```{r OverallSummary, echo = FALSE}
+
+#create data frame with information on what was imported
+load_results <- data.frame("Component" = c("Site Visits","Video Dots","Species List Entries","Coral Disease Entries", "CDR Entries"), "Count" = c(nrow(site_visits),nrow(video),nrow(species),nrow(disease),nrow(cdr)))
+
+#format the numbers a bit so they look better in the table
+load_results <- load_results %>%
+  mutate_all(list(~prettyNum(., big.mark=",")))
+
+#show the table in the dashboard
+load_results %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed","bordered"),full_width = F, position = "left")
+```
+
+------------------------------------------------------------------------
+
+</center>
+
+# QC Checks {.tabset}
+
+## Video
+
+### 1) Missing Video Transects
+
+This check looks for Annual or Episodic site visits with no video transects entered into the database.
+
+```{r NoVideo, echo = FALSE, warning = FALSE, results='asis'}
+QC_results1.1 <- site_visits %>%
+  filter(VideoTransects == 0) %>%
+  select(TripName, Project, Purpose, Site, VideoTransects)
+
+#show the table in the dashboard
+WriteDataTable(QC_results1.1)
+```
+
+### 2) Missing QC Video Transects
+
+This check calculates the total number of transects with video for a trip and compares that to the number of completed QC analysis transects for the same trip. The protocol specifies that 10% of transects on a trip should be reanalyzed as a QC transect, although these same methods were applied to a number of years prior to the 2017 publication of the protocol.
+
+```{r QCVideoTransects, echo = FALSE, warning = FALSE, results='asis'}
+QC_results1.2 <- site_visits %>%
+  group_by(TripName) %>%
+  mutate(TripTransects = sum(VideoTransects)) %>%
+  mutate(TripQCTransects = sum(QCVideoTransects)) %>%
+  mutate(Percent = TripQCTransects/TripTransects) %>%
+  filter(Percent < 0.1) %>%
+  select(TripName, Project, Purpose, TripTransects, TripQCTransects) %>%
+  distinct()
+
+#show the table in the dashboard
+WriteDataTable(QC_results1.2)
+```
+
+### 3) Dot Count Per Image
+
+This check looks for video frames that are not exactly 10 dots. Each frame is overlaid with 10 random boxes/dots for analysis.
+
+```{r DotCountPerImage, echo = FALSE, warning = FALSE, results='asis'}
+QC_results1.3 <- video %>%
+  group_by(TripName, Project, Purpose, Site, Transect, Frame, IsQAQCObservation) %>%
+  add_tally %>%
+  rename(QAQC = IsQAQCObservation) %>%
+  filter(n != 10) %>%
+  select(TripName, Project, Purpose, Site, Transect, Frame, QAQC, n) %>%
+  distinct()
+
+#show the table in the dashboard
+WriteDataTable(QC_results1.3)
+```
+
+------------------------------------------------------------------------
+
+### 4) Blank TaxonCode
+
+This check looks for dots that are have a NA or 'No Taxon' value for TaxonCode.
+
+```{r BlankTaxonCode, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results1.4 <- video %>%
+  filter(is.na(TaxonCode) == "TRUE" | TaxonCode == "No Taxon") %>%
+  select(TripName, Purpose, Site, Transect, Frame, Point, TaxonCode)
+
+#show the table in the dashboard
+WriteDataTable(QC_results1.4)
+```
+
+------------------------------------------------------------------------
+
+### 5) High/Low Frame Counts
+
+This check looks for transects with an unexpected number of frames/images. The number of frames captured along the 10m transect can vary through time based on equipment, videographer, and capturing technique, but generally falls within a similar range. This check calculates the interquartile range (IQR). Outliers are values below Q1 - (1.5 x IQR) and Q3 + (1.5 x IQR).
+
+```{r HighLowImageCounts, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results1.5 <- video %>%
+  select(TripName, Project, Purpose, Site, Transect, Frame) %>%
+  distinct %>%
+  group_by(TripName, Project, Purpose, Site, Transect) %>%
+  add_tally %>%
+  ungroup() %>%
+  select(TripName, Purpose, Site, Transect, n) %>%
+  distinct %>%
+  arrange(n) %>%
+  filter(n > ReturnIQR("high",n) | n < ReturnIQR("low",n))
+
+#show the table in the dashboard
+WriteDataTable(QC_results1.5)
+```
+
+------------------------------------------------------------------------
+
+### 6) Bleached Non-Corals
+
+This check looks for non-coral with a bleaching code.
+
+```{r BleachedNonCorals, echo = FALSE, warning = FALSE, results='asis'}
+QC_results1.6 <- video %>%
+  filter(is.na(BleachingCode) == FALSE & Category != "CORAL") %>%
+  select(TripName, Project, Purpose, Site, Transect, Frame, Category,  BleachingCode)
+ 
+#show the table in the dashboard
+WriteDataTable(QC_results1.6)
+```
+
+------------------------------------------------------------------------
+
+### 7) Unexpected Transect Count
+
+This check looks for site visits with a transect count that is anything other than 4 or 20. Keep in mind that any transects that are excluded (ExcludeObservation = 0) will no longer show up in the exported dataset and may trigger this warning.
+
+```{r TransectCountsPerSiteVisit, echo = FALSE, warning = FALSE, results='asis'}
+QC_results1.7 <- video %>%
+  select(TripName, Project, Purpose, Site, Transect) %>%
+  distinct() %>%
+  group_by(TripName, Project, Purpose, Site) %>%
+  add_tally() %>%
+  select(TripName, Project, Purpose, Site, n) %>%
+  distinct() %>%
+  filter(n != 4 & n != 20) %>%
+  arrange(TripName)
+  
+#show the table in the dashboard
+WriteDataTable(QC_results1.7)
+```
+
+------------------------------------------------------------------------
+
+### 8) Transects with Blank Analyzer
+
+This check looks for transects where the video analyzer is blank. This was not recorded routinely prior to 2013, so only dates >= 2013 are shown here.
+
+```{r BlankAnalyzer, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results1.8 <- video %>%
+  filter(IsQAQCObservation == 0) %>%
+  filter(Year >= 2014) %>%
+  filter(is.na(Analyzer) == "TRUE") %>%
+  select(TripName, Project, Purpose, Site, Transect, Analyzer) %>%
+  distinct() %>%
+  arrange(desc(TripName))
+
+#show the table in the dashboard
+WriteDataTable(QC_results1.8)
+```
+
+------------------------------------------------------------------------
+
+### 9) Mismatch between Frame Count (calculated) and 'Number of Frames' 
+
+This calculates the actual number of entered frames, compares that to the ‘Number of Frames’ field, and displays any mismatches. Errors could either be in what was entered or the entry of the ‘Number of Frames’.
+
+```{r, echo = FALSE, warning = FALSE, results='asis'}
+QC_results1.9 <- video %>%
+  select(TripName, Project, Purpose, Site, Transect, Frame, IsQAQCObservation) %>%
+  distinct() %>%
+  group_by(TripName, Project, Purpose, Site, Transect,IsQAQCObservation) %>%
+  mutate(FrameCount = n()) %>%
+  mutate(FrameMax = max(Frame)) %>%
+  select(TripName, Project, Purpose, Site, IsQAQCObservation, Transect, FrameCount, FrameMax) %>%
+  distinct() %>%
+  filter(FrameCount != FrameMax) %>%
+  arrange(desc(TripName))
+
+#show the table in the dashboard
+WriteDataTable(QC_results1.9)
+```
+
+------------------------------------------------------------------------
+
+### 10) Bleaching Codes Used
+
+This informational check summarizes the bleaching codes used (with counts) by year.
+
+```{r BleachingCodesUsed, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results1.10 <- video %>%
+  group_by(Year,BleachingCode) %>%
+  summarize(BleachingCode_Count=n()) %>%
+  arrange(desc(Year)) %>%
+  filter(!is.na(BleachingCode)) %>%
+  spread(Year,BleachingCode_Count) %>%
+  mutate_if(is.numeric, replace_na, 0) %>%
+  rename(Code = BleachingCode)
+  
+#show the table in the dashboard
+QC_results1.10 %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed","bordered"),full_width = F, position = "left")
+```
+
+------------------------------------------------------------------------
+
+### 11) Taxon Codes Used
+
+This informational check summarizes the TaxonCodes used by year.
+
+```{r TaxonCodesUsed, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results1.11 <- video %>%
+  #filter(Year>2005) %>%
+  group_by(Year,TaxonCode) %>%
+  summarize(TaxonCode_Count=n()) %>%
+  arrange(desc(Year),desc(TaxonCode_Count)) %>%
+  spread(Year,TaxonCode_Count)
+  
+#show the table in the dashboard
+WriteDataTable(QC_results1.11)
+
+#alternative table option
+#QC_results1.11 %>%
+#  kable() %>%
+#  kable_styling(bootstrap_options = c("striped", "hover", "condensed","bordered"),full_width = F, position = "left")
+
+```
+
+------------------------------------------------------------------------
+
+### 12) Black Corals
+
+This informational check identifies any ANTI - black coral - codes from the video analysis. These will need to be removed from public datasets.
+
+```{r, echo = FALSE, warning = FALSE, results='asis'}
+QC_results1.12 <- video %>%
+  filter(TaxonCode == "ANTI") %>%
+  select(TripName, Project, Purpose, Site, Transect, Frame, TaxonCode)
+
+#show the table in the dashboard
+WriteDataTable(QC_results1.12)
+```
+
+```{r, echo = FALSE, warning = FALSE, eval = FALSE, results='asis'}
+### 13) Database / Server Frame Discrepency
+
+#This check reviews the number of entered frames for each transect and compares it to the number of images in the corresponding #folder on the server. The server side is correct by subtracting 1 because we capture a "slate" image that is not analyzed. Any #discrepncy is shown here so that it can be reviewed further.
+
+#convert dates to date format
+video$StartDate <- as.Date(video$StartDate, format = "%m/%d/%Y")
+
+QC_results1.13 <- video %>%
+  select(TripName, Park, Year, StartDate, Project, Purpose, Site, Transect, Frame) %>%
+  distinct() %>%
+  group_by(TripName, Project, Purpose, Site, Transect) %>%
+  mutate(FrameCount = n()) %>%
+  select(TripName, Park, Year, StartDate, Project, Purpose, Site, Transect, FrameCount) %>%
+  distinct() %>%
+  mutate(ServerFolder = paste0("Z:\\SFCN\\Vital_Signs\\Marine_benthic_communities\\CoralMonitoring\\images\\coral_video\\",Park,"\\",Site,"\\",format(StartDate, format="%Y%m"),"_",Purpose,"_HDGH4\\",format(StartDate, format="%Y%m"),"_",Site,"_destination\\",str_pad(Transect, 2, pad = "0"),"_",Site,"_",format(StartDate, format="%Y%m"))) %>%
+  #then try to get count from the server
+  select(-Park) %>%
+  arrange(desc(TripName))
+
+# QC_results3.8 <- disease_photos %>%
+#   filter(TransectDiseaseFree == 0 | is.na(TransectDiseaseFree)) %>%
+#   mutate(ExpectedFullFilename = paste0('Z:\\SFCN\\Vital_Signs\\Marine_benthic_communities\\CoralMonitoring\\images\\disease\\',Park,
+#       '\\',Site,'\\', format(StartDate, format="%Y%m"),'\\', format(StartDate, format="%Y%m"),'_',Site,'_T',str_pad(Transect, 2, pad = "0"),
+#       '_dis',str_pad(Colony, 2, pad = "0"),Lesion,'.jpg')) %>%
+#   mutate(ExpectedFilename = paste0(format(StartDate, format="%Y%m"),'_',Site,'_T',str_pad(Transect, 2, pad = "0"),'_dis',
+#       str_pad(Colony, 2, pad = "0"),Lesion,'.jpg')) %>%
+#   mutate(FileCheck = file.exists(ExpectedFullFilename)) %>%
+#   filter(FileCheck == FALSE, Year > 2007) %>%
+#   select(TripName,Year,Site,Transect,Colony,Lesion,DiseaseCode,TaxonCode,Notes,ExpectedFilename)
+
+#show the table in the dashboard
+WriteDataTable(QC_results1.13)
+```
+
+## Species
+
+### 1) Species Presence through Time (Dynamic)
+
+This dynamic heatmap (choose a site) shows the percentage of transects recording a species at a particular site.
+
+```{r SpeciesPresenceAbsence, echo = FALSE, warning = FALSE, message = FALSE, eval = FALSE, results='asis'}
+
+#this code chunk is currently turned off in favor of the heat map below...but it was a tabular way to show a site transect through time and include the person who did each data collection. I left it just in case we find a future use.
+
+QC_results2.1 <- species %>%
+  filter(Site=='AM', Transect==1) %>%
+  mutate(YearName = paste(Year,FullName)) %>%
+  group_by(YearName,TaxonCode) %>%
+  #group_by(paste(Year,FullName, sep =" "), TaxonCode) %>%
+  summarize(TaxonCode_Count=n()) %>%
+  mutate(TaxonCode_Count=recode(TaxonCode_Count,`1`="Present")) %>%
+  #rename(Year_Observer = paste(Year,FullName)) %>%
+  #arrange(Year,FullName,desc(TaxonCode_Count)) %>%
+  spread(YearName,TaxonCode_Count)
+  #spread(paste(Year,FullName),TaxonCode_Count)
+  
+#this table option using the formatter package...allowing us to colorize based on value
+customGreen = "#228B22"
+species_formatter <- formatter("span", style = x ~ formattable::style(font.weight = "bold", color = ifelse(x == "Present", customGreen, ifelse(x < 0, customRed, "black"))))
+
+formattable(QC_results2.1,
+      list(`Taxon Code` = formatter("span", style = ~ formattable::style(color = "grey",font.weight = "bold")),
+      area(col = 2:ncol(QC_results2.1)) ~ species_formatter),
+      align = c("l", rep("c", ncol(QC_results2.1)-1))
+    )
+
+```
+
+```{r echo = FALSE}
+  inputPanel(
+      selectInput(inputId = "site_species",label = "Select a site:",choices = sort(unique(species$Site)),selected = "HA")
+  )
+  plotlyOutput("show_species_heatmap", width = "1000px", height = "800px")
+```
+
+```{r echo = FALSE}
+output$show_species_heatmap <- renderPlotly({
+  MySite <- input$site_species
+  #MySite <- "BAR"
+  
+  #calculate the number of species lists created at a site
+  TransectVisits <- species %>%
+    filter(Site == MySite) %>%
+    mutate(ParkSite = paste(Park,Site, sep = "_")) %>%
+    mutate(ParkSiteYear = paste(Park,Site,Year, sep = "_")) %>%
+    select(TripName,ParkSite,ParkSiteYear,Park,Site,Transect,Year) %>%
+    distinct() %>%
+    group_by(ParkSiteYear) %>%
+    add_tally() %>%
+    ungroup() %>%
+    select(ParkSiteYear,ParkSite,n) %>%
+    distinct() %>%
+    rename(TransectVisits = n)
+  
+  #calculate the number of occurrences of each TaxonCode on a transect
+  TaxonCounts <- species %>%
+    filter(Site == MySite) %>%
+    select (Year,Park,Site,Transect,TaxonCode) %>%
+    mutate(ParkSiteYear = paste(Park,Site,Year, sep = "_")) %>%
+    group_by (ParkSiteYear,TaxonCode) %>%
+    add_tally() %>%
+    arrange(ParkSiteYear,TaxonCode) %>%
+    rename(SpeciesListCount = n) %>%
+    select(-Transect) %>%
+    ungroup() %>%
+    distinct() %>%
+    arrange(ParkSiteYear, desc(SpeciesListCount))
+  
+  #combine and get percentage
+  SpeciesListSummary <- TaxonCounts %>%
+    inner_join(TransectVisits, by ="ParkSiteYear") %>%
+    mutate(Percentage = (SpeciesListCount / TransectVisits)*100)
+  
+  ViridisChoice <- "C"
+  #create the graph
+  ggplot(SpeciesListSummary, aes(x=Year, y=reorder(TaxonCode,SpeciesListSummary$Percentage), fill= Percentage)) + 
+    geom_tile() + #+ xlim(NA, 2020) +
+    scale_x_continuous(breaks = breaks_width(1)) +
+    ggtitle(paste0("Site Level Species Lists - ", MySite)) + # for the main title
+    xlab("Year") + # for the x axis label
+    ylab("Taxon Code") + # for the y axis label
+    guides(fill=guide_colourbar(title="Percentage of Transects")) +
+    scale_fill_viridis(option = ViridisChoice) + theme_minimal() + 
+    theme(axis.text = element_text(size = 13))
+})
+```
+
+------------------------------------------------------------------------
+
+### 2) Black Corals
+
+This informational check shows ANTI - black coral - codes listed in the species dataset.
+
+```{r BlackCorals, echo = FALSE, warning = FALSE, results='asis'}
+QC_results2.2 <- species %>%
+  filter(TaxonCode == "ANTI") %>%
+  select(TripName, Project, Purpose, Site, Transect, TaxonCode) %>%
+  arrange(desc(TripName))
+
+WriteDataTable(QC_results2.2)
+```
+
+------------------------------------------------------------------------
+
+### 3) Potential Missing Species on Transects
+
+This is a table of potential mismatches between the coral species recorded at transects in situ and the coral species identified through the video analysis. Only transects where species lists were collected are included.
+
+```{r , echo = FALSE, warning = FALSE, results='asis'}
+#which trips have species lists?
+Visits <- species %>%
+  select(TripName,Purpose,Site) %>%
+  mutate(TripPurposeSite = paste(TripName,Purpose,Site,sep="_")) %>%
+  group_by(TripPurposeSite) %>%
+  add_tally() %>%
+  mutate(SpeciesListCollected = if_else(n>0,"Yes","No")) %>%
+  select(TripPurposeSite,SpeciesListCollected) %>%
+  distinct()
+
+#summarize species list information
+Species_transect <- species %>%
+  mutate(TripPurposeSiteTransect = paste(TripName,Purpose,Site,sprintf("%02d",Transect), sep = "_")) %>%
+  filter (Year >= 2009) %>%  #we didn't collect species lists prior to 2009
+  select(TripPurposeSiteTransect, TaxonCode) %>%
+  group_by (TripPurposeSiteTransect,TaxonCode) %>%
+  add_tally() %>%
+  rename(SpeciesListCount = n) %>%
+  distinct() %>%
+  mutate(TaxonCode = as.character(TaxonCode))
+
+#summarize to the site level and add a tally of how many transects had that species
+Species_site <- species %>%
+  mutate(TripPurposeSite = paste(TripName,Purpose,Site, sep = "_")) %>%
+  filter (Year >= 2009) %>%  #we didn't collect species lists prior to 2009
+  select(TripPurposeSite, TaxonCode) %>%
+  group_by (TripPurposeSite,TaxonCode) %>%
+  add_tally() %>%
+  rename(SpeciesListCount = n) %>%
+  distinct() %>%
+  mutate(TaxonCode = as.character(TaxonCode))
+
+#summarize video at the transect level
+#remove several that are not species level (AGSP, MILL, PBSP) or are otherwise generic (CORALU, CORJU)
+Video_transect <- video %>%
+  mutate(TripPurposeSiteTransect = paste(TripName,Purpose,Site,sprintf("%02d",Transect), sep = "_")) %>%
+  filter(Category == "CORAL") %>%
+  filter (Year >= 2009) %>%  #we didn't collect species lists prior to 2009
+  mutate(Frame = if_else(IsQAQCObservation == 1, paste0("qc",Frame), as.character(Frame))) %>%
+  select(TripPurposeSiteTransect, TripName, Year, Purpose, Park, Site, Transect, Frame, Point, TaxonCode) %>%
+  group_by (TripPurposeSiteTransect,TaxonCode) %>%
+  add_tally() %>%
+  rename(VideoObservationCount = n) %>%
+  filter(TaxonCode != "ORBI", TaxonCode != "CORALU", TaxonCode !="CORJU", TaxonCode !="AGAR", TaxonCode !="MILL", TaxonCode != "MYCE", TaxonCode !="PBSP", TaxonCode != "PSEU", TaxonCode != "UNK", TaxonCode != "SCOL", TaxonCode != "CORALU") %>%
+  distinct() %>%
+  mutate(TaxonCode = as.character(TaxonCode))
+
+#summarize video at the site level
+Video_site <- video %>%
+  mutate(TripPurposeSite = paste(TripName,Purpose,Site, sep = "_")) %>%
+  filter(Category == "CORAL") %>%
+  filter (Year >= 2009) %>%  #we didn't collect species lists prior to 2009
+  mutate(Frame = if_else(IsQAQCObservation == 1, paste0("qc",Frame), as.character(Frame))) %>%
+  select(TripPurposeSite, TripName, Year, Purpose, Park, Site, Transect, Frame, Point, TaxonCode) %>%
+  group_by (TripPurposeSite,TaxonCode) %>%
+  add_tally() %>%
+  rename(VideoObservationCount = n) %>%
+  filter(TaxonCode != "ORBI", TaxonCode != "CORALU", TaxonCode !="CORJU", TaxonCode !="AGAR", TaxonCode !="MILL", TaxonCode != "MYCE", TaxonCode !="PBSP", TaxonCode != "PSEU", TaxonCode != "UNK", TaxonCode != "SCOL", TaxonCode != "CORALU") %>%
+  distinct() %>%
+  ungroup() %>%
+  arrange(TripPurposeSite, desc(VideoObservationCount)) %>%
+  mutate(TaxonCode = as.character(TaxonCode))
+
+Summary_transect <- Species_transect %>%
+  full_join(Video_transect, by = c("TripPurposeSiteTransect","TaxonCode")) %>%
+  filter (is.na(SpeciesListCount)) %>%
+  mutate(SpeciesListCount = ifelse(is.na(SpeciesListCount), 0, SpeciesListCount)) %>%  #change SpeciesListCount NAs to 0
+  arrange(desc(TripName),Purpose,Transect,TaxonCode) %>%
+  ungroup() %>%
+  select(TripName, Park, Year, Purpose, Site, Transect, Frame, Point, TaxonCode, VideoObservationCount, SpeciesListCount)
+
+Summary_site <- Species_site %>%
+  full_join(Video_site, by = c("TripPurposeSite","TaxonCode")) %>%
+  filter (is.na(SpeciesListCount)) %>%
+  mutate(SpeciesListCount = ifelse(is.na(SpeciesListCount), 0, SpeciesListCount)) %>%  #change SpeciesListCount NAs to 0
+  arrange(desc(TripName),Purpose,Site,TaxonCode) %>%
+  ungroup() %>%
+  select(TripName, Park, Year, Purpose, Site, Transect, Frame, Point, TaxonCode, VideoObservationCount, SpeciesListCount)
+
+#Summarize down to one row per entry - transect level
+Summary_transect_slimmed <- Summary_transect %>%
+  mutate(FrameDot = paste0(Frame,Point))
+Summary_transect_slimmed <- as.data.table(Summary_transect_slimmed)[, toString(FrameDot), by = list(TripName,Park,Year,Purpose,Site,Transect,TaxonCode,VideoObservationCount,SpeciesListCount)]
+Summary_transect_slimmed <- Summary_transect_slimmed %>%
+  select(-SpeciesListCount) %>%
+  mutate(TripPurposeSite = paste(TripName,Purpose,Site,sep="_")) %>%
+  rename(FrameDots = V1) %>%
+  left_join(Visits, by = c("TripPurposeSite")) %>%
+  mutate(SpeciesListCollected = ifelse(is.na(SpeciesListCollected), "No", SpeciesListCollected)) %>%
+  select(TripName, Park, Year, Purpose, Site, Transect, TaxonCode, VideoObservationCount, SpeciesListCollected, FrameDots) %>%
+  filter(SpeciesListCollected == "Yes") %>%
+  rename(VideoCount = VideoObservationCount) %>%
+  select(-Park,-SpeciesListCollected) %>%
+  arrange(desc(TripName), Year, Purpose, Site, Transect, FrameDots)
+
+#Summarize down to one row per entry - site level
+Summary_site_slimmed <- Summary_site %>%
+  mutate(Transect_FrameDot = paste0(Transect,"_",Frame,Point))
+Summary_site_slimmed <- as.data.table(Summary_site_slimmed)[, toString(Transect_FrameDot), by = list(TripName,Park,Year,Purpose,Site,TaxonCode,VideoObservationCount,SpeciesListCount)]
+Summary_site_slimmed <- Summary_site_slimmed %>%
+  select(-SpeciesListCount) %>%
+  mutate(TripPurposeSite = paste(TripName,Purpose,Site,sep="_")) %>%
+  rename(Transect_FrameDot = V1) %>%
+  left_join(Visits, by = c("TripPurposeSite")) %>%
+  mutate(SpeciesListCollected = ifelse(is.na(SpeciesListCollected), "No", SpeciesListCollected)) %>%
+  select(TripName, Park, Year, Purpose, Site, TaxonCode, VideoObservationCount, SpeciesListCollected,Transect_FrameDot) %>%
+  filter(SpeciesListCollected == "Yes") %>%
+  rename(VideoCount = VideoObservationCount) %>%
+  select(-Park,-SpeciesListCollected) %>%
+  arrange(desc(TripName), Year, Purpose, Site, Transect_FrameDot)
+
+#clean up a few objects that are no longer needed
+remove(Summary_site,Summary_transect,Video_site,Video_transect,Visits,Species_site,Species_transect)
+WriteDataTable(Summary_transect_slimmed)
+```
+
+------------------------------------------------------------------------
+
+### 4) Potential Missing Species at Sites
+
+This is a table of potential mismatches between the coral species recorded at sites in situ and the coral species identified through the video analysis. Only sites where species lists were collected are included.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+WriteDataTable(Summary_site_slimmed)
+```
+
+------------------------------------------------------------------------
+
+### 5) Transects with AGRA
+
+This check looks for transects that have AGRA (*Agaricia grahamae*).
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results2.5 <- species %>%
+  filter(TaxonCode == "AGRA") %>%
+  select(TripName, Project, Purpose, Site, Transect, TaxonCode, FullName) %>%
+  arrange(desc(TripName))
+
+WriteDataTable(QC_results2.5)
+```
+
+### 6) Unverified Species Lists
+
+This check looks for species lists that have not been marked as verified in the database.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results2.6 <- species %>%
+  filter(is.na(Verifier) | is.na(VerifiedDate)) %>%
+  select(TripName,Project,Site,Transect,Verifier,VerifiedDate) %>%
+  distinct()
+  
+WriteDataTable(QC_results2.6)
+```
+
+## Disease
+
+### 1) Double Disease Free Transect
+
+This check looks for transects where more than one entry is marked as disease free.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.1 <- disease %>%
+  group_by(TripName, Purpose, Project, Park, Site, Transect, TransectDiseaseFree) %>%
+  summarize(Tally = n()) %>%
+  filter(TransectDiseaseFree == 1, Tally > 1)
+
+WriteDataTable(QC_results3.1)
+```
+
+------------------------------------------------------------------------
+
+### 2) Not Disease Free
+
+This check looks for transects with a disease free entry and one or more lesions, indicating that the transect is not really disease free.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.2 <- disease %>%
+  group_by(TripName, Purpose, Project, Park, Site, Transect, DiseaseCode, TransectDiseaseFree) %>%
+  summarize(Tally = n()) %>%
+  filter(TransectDiseaseFree == 1 & !is.na(DiseaseCode))
+
+WriteDataTable(QC_results3.2)
+```
+
+------------------------------------------------------------------------
+
+### 3) Empty Disease Entry
+
+This check looks for lesions that are missing the DiseaseCode and TransectDiseaseFree flag.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.3 <- disease %>%
+  filter(is.na(TransectDiseaseFree) & is.na(DiseaseCode)) %>%
+  select(TripName,Purpose,Park,Site,Transect,Colony,Lesion,DiseaseCode,TransectDiseaseFree)
+
+WriteDataTable(QC_results3.3)
+```
+
+------------------------------------------------------------------------
+
+### 4) Missing Discoloration Disease Values
+
+This check looks for disease entries were either '\# of Blemishes' or '% Discolored' is zero.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.4 <- disease %>%
+  filter(NumOfBlemishes == 0 | DiscoloredTissue == 0) %>%
+  select(TripName,Purpose,Site,Transect,Colony,Lesion,NumOfBlemishes,DiscoloredTissue,DiseaseCode,Observer)
+
+WriteDataTable(QC_results3.4)  
+```
+
+------------------------------------------------------------------------
+
+### 5) Potential Tissue Loss Lesion Issues
+
+This check looks for disease lesions with a length or width greater than 1 meter.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.5 <- disease %>%
+  filter(Length_cm > 100 | Width_cm >100) %>%
+  select(TripName,Purpose,Site,Transect,Colony,Lesion,Length_cm,Width_cm,DiseaseCode,Observer)
+
+WriteDataTable(QC_results3.5)  
+```
+
+------------------------------------------------------------------------
+
+### 6) Potential Discoloration Lesion Issues
+
+This check looks for disease lesions where '% Discolored Tissue' \>= 90%.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.6 <- disease %>%
+  filter(DiscoloredTissue >= 90) %>%
+  select(TripName,Purpose,Site,Transect,Colony,Lesion,NumOfBlemishes,DiscoloredTissue,DiseaseCode,Observer)
+
+WriteDataTable(QC_results3.6)  
+```
+
+------------------------------------------------------------------------
+
+### 7) Both Tissue Loss and Discoloration Metrics
+
+This check looks for lesions that have both tissue loss (length & widths) and discoloration metrics (% discolored & number of blemishes).
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.7 <- disease %>%
+  filter((Length_cm > 0 | Width_cm > 0) & (DiscoloredTissue > 0 | NumOfBlemishes > 0)) %>%
+  select(TripName,Purpose,Project,Park,Site,Transect,Colony,Lesion, Length_cm,Width_cm,DiscoloredTissue,NumOfBlemishes,DiseaseCode,Observer)
+
+WriteDataTable(QC_results3.7) 
+```
+
+------------------------------------------------------------------------
+
+### 8) Unlinked Disease Photos
+
+This check looks for disease lesions that do not have a matching photograph on the Z drive. Note: This check is only done on disease lesions collected since 2008 and requires an active connection to the SFCN shared network "Z" drive.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, eval = TRUE, results='asis'}
+#copy disease data to work with it
+disease_photos <- disease
+#convert dates to date format
+disease_photos$StartDate <- as.Date(disease$StartDate, format = "%m/%d/%Y")
+#remove NA's from lesions
+disease_photos$Lesion[is.na(disease$Lesion)] = ''
+#only look in 2008-present so we don't waste effort on photos that don't exist
+disease_photos <- disease_photos %>%
+  filter(Year >= 2008)
+
+if (DiseasePhotoCheck == FALSE) {
+  cat ('\n***<font color="red">Skipping this test based on DiseasePhotoCheck = FALSE at the top of this document.</font>***\n')
+  QC_results3.8 <- data.frame(Empty=character(), stringsAsFactors=FALSE) 
+} else {
+  QC_results3.8 <- disease_photos %>%
+  filter(TransectDiseaseFree == 0 | is.na(TransectDiseaseFree)) %>%
+  mutate(ExpectedFullFilename = paste0('Z:\\SFCN\\Vital_Signs\\Marine_benthic_communities\\CoralMonitoring\\images\\disease\\',Park,'\\',Site,'\\', format(StartDate, format="%Y%m"),'\\', format(StartDate, format="%Y%m"),'_',Site,'_T',str_pad(Transect, 2, pad = "0"),'_dis',str_pad(Colony, 2, pad = "0"),Lesion,'.jpg')) %>%
+  mutate(ExpectedFilename = paste0(format(StartDate, format="%Y%m"),'_',Site,'_T',str_pad(Transect, 2, pad = "0"),'_dis',str_pad(Colony, 2, pad = "0"),Lesion,'.jpg')) %>%
+  mutate(FileCheck = file.exists(ExpectedFullFilename)) %>%
+  filter(FileCheck == FALSE) %>%
+  select(TripName,Year,Site,Transect,Colony,Lesion,DiseaseCode,TaxonCode,Notes,ExpectedFilename)
+  WriteDataTable(QC_results3.8)
+}
+```
+
+------------------------------------------------------------------------
+
+### 9) Missing Tissue Loss Values
+
+This check looks for disease lesions that have a length or width of zero.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.9 <- disease %>%
+  filter(Length_cm == 0 | Width_cm == 0) %>%
+  select(TripName,Purpose,Site,Transect,Colony,Lesion,Length_cm,Width_cm,DiseaseCode,Observer)
+
+WriteDataTable(QC_results3.9)  
+```
+
+------------------------------------------------------------------------
+
+### 10) Unknown Disease Type
+
+This check looks for disease lesions that use the UNK disease code.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.10 <- disease %>%
+  filter(DiseaseCode == "UNK") %>%
+select(TripName,Purpose,Project,Park,Site,Transect,Colony,Lesion,DiseaseCode)
+
+WriteDataTable(QC_results3.10)
+```
+
+------------------------------------------------------------------------
+
+### 11) DS Disease Type
+
+This check looks for disease lesions that use the DS code. This older code has been replaced by more specific DS combinations (e.g. DS2 or DS124).
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.11 <- disease %>%
+  filter(DiseaseCode == "DS") %>%
+  select(TripName,Purpose,Site,Transect,Colony,DiseaseCode,Notes)
+
+WriteDataTable(QC_results3.11) 
+```
+
+------------------------------------------------------------------------
+
+### 12) WBLO Disease Type
+
+This check looks for disease lesions that use the WBLO disease code.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.12 <- disease %>%
+   filter(DiseaseCode == "WBLO") %>%
+select(TripName,Purpose,Project,Park,Site,Transect,Colony,Lesion,DiseaseCode)
+  
+WriteDataTable(QC_results3.12)
+```
+
+------------------------------------------------------------------------
+
+### 13) YB with Wrong Metrics
+
+This check looks for YB disease lesions that use the % Discolored and \# of Blemishes instead of Length x Width.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.13 <- disease %>%
+  filter(DiseaseCode == "YB") %>%
+  filter(NumOfBlemishes > 0 & DiscoloredTissue > 0) %>%
+  select(TripName,Purpose,Project,Site,Transect,Colony,Lesion,NumOfBlemishes,DiscoloredTissue)
+  
+WriteDataTable(QC_results3.13)
+```
+
+------------------------------------------------------------------------
+
+### 14) Unverified Disease Lesions
+
+This check looks for disease entries that have not been marked as verified in the database.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results3.14 <- disease %>%
+   filter(is.na(Verifier) | is.na(VerifiedDate)) %>%
+select(TripName,Project,Site,Transect,Colony,Lesion,Verifier,VerifiedDate)
+  
+WriteDataTable(QC_results3.14)
+```
+
+------------------------------------------------------------------------
+
+### 15) Distance from Transect (Dynamic)
+
+These dynamic density plots (choose a year) show patterns in the distance from transect (cm) and may provide insight into search effort patterns.
+
+```{r echo = FALSE}
+  inputPanel(
+      selectInput(inputId = "year_distance",label = "Select a year:",choices = unique(disease$Year))
+  )
+  plotlyOutput("showDiseaseDistanceFromTransect", width = "900px", height = "650px")
+```
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+output$showDiseaseDistanceFromTransect <- renderPlotly({
+  QC_results3.15 <- disease %>%
+    filter(!is.na(DistanceFromTransect_cm)) %>%
+    filter(Year == input$year_distance) %>%
+    select(Park,Year,DistanceFromTransect_cm)
+  
+  ggplot(QC_results3.15, aes(x=DistanceFromTransect_cm)) +
+    geom_density(color="darkblue", fill="lightblue") +
+    facet_wrap(~ Park) +
+    #labs(color = 'Legend') +
+    #scale_x_date(date_breaks = "1 year",date_labels = "%Y") +
+    ylab("Density") + xlab("Distance from Transect (cm)")
+})
+```
+
+------------------------------------------------------------------------
+
+### 16) Disease Types by Park (Dynamic)
+
+This dynamic bar chart (choose a park) shows patterns in the disease types recorded over time.
+
+```{r echo = FALSE}
+  inputPanel(
+      selectInput(inputId = "park_disease",label = "Select a site:",choices = unique(disease$Park),selected = "VIIS")
+      #selectInput(inputId = "year",label = "Select a year:",choices = unique(disease$Year))
+  )
+  plotlyOutput("showDiseaseByPark", width = "900px", height = "650px")
+```
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+output$showDiseaseByPark <- renderPlotly({
+  QC_results3.16 <- disease %>%
+    filter(!is.na(DiseaseCode)) %>%
+    filter(Park == input$park_disease) %>%
+    select(Park,Year,DiseaseCode) %>%
+    group_by(Park,Year,DiseaseCode) %>%
+    add_tally() %>%
+    distinct()
+  
+  ggplot(QC_results3.16, aes(x=Year, y=n, fill=DiseaseCode)) +
+    geom_bar(stat="identity") +
+    ylab("Lesion Count") + xlab("Year")
+    #scale_x_date(date_breaks = "1 year",date_labels = "%Y")
+})
+```
+
+## CDR
+
+### 1) Colony Count Comparision (Dynamic)
+
+This dynamic line graph (choose a site and transect) shows a comparison of colony count 1 and colony count 2 and the average.
+
+```{r echo = FALSE}
+  inputPanel(
+      selectInput(inputId = "site_colony",label = "Select a site:",choices = unique(cdr$Site),selected = "SR"),
+      selectInput(inputId = "transect_colony",label = "Select a transect:",choices = unique(cdr$Transect),selected = 1)
+  )
+  plotlyOutput("showCDR", width = "900px", height = "650px")
+```
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+#Create a line graph (with multiple lines) depicting the data using ggplot
+#test <- cdr %>%
+#  filter(Site=="SR", Transect=="1")
+
+output$showCDR <- renderPlotly({
+  QC_results4.1 <- cdr %>%
+  filter(Site==input$site_colony, Transect==input$transect_colony) %>%
+  mutate(StartDate = as.Date(StartDate, format="%m/%d/%Y")) %>%
+  select(StartDate,Year,StonyCoralCountObserver_1,StonyCoralCount_1,StonyCoralCountObserver_2,StonyCoralCount_2) %>%
+  rowwise() %>%
+  mutate(Average_Stony=mean(c(StonyCoralCount_1,StonyCoralCount_2))) %>%
+  arrange(Year)
+  
+  ggplot(QC_results4.1, aes(x=StartDate)) +
+    geom_line(aes(y=StonyCoralCount_1, color = "Stony Coral Count 1")) +
+    geom_line(aes(y=StonyCoralCount_2, color = "Stony Coral Count 2")) +
+    geom_line(aes(y=Average_Stony, color = "Average Stony")) +
+    geom_point(aes(y=StonyCoralCount_1,text=paste0("Observer: ", StonyCoralCountObserver_1)), color = "blue") +
+    geom_point(aes(y=StonyCoralCount_2,text=paste0("Observer: ",StonyCoralCountObserver_2)), color = "orange") +
+    geom_point(aes(y=Average_Stony), color = "green") +
+    scale_color_manual(values = c('Stony Coral Count 1'= 'blue', 'Stony Coral Count 2' = 'orange','Average Stony' = 'green')) +
+    labs(color = 'Legend') +
+    scale_x_date(date_breaks = "1 year",date_labels = "%Y") +
+    xlab("Year") + ylab("Stony Coral Count")
+  
+})
+```
+
+------------------------------------------------------------------------
+
+### 2) Potential Diadema Outliers
+
+This check looks for diadema counts that are greater than or equal to 10 as potential outliers.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results4.2 <- cdr %>%
+  filter(!is.na(Diadema)) %>%
+  filter(Diadema > 10) %>%
+  select(TripName, Purpose, Project, Park, Site, Transect, Diadema)
+
+WriteDataTable(QC_results4.2)
+```
+
+------------------------------------------------------------------------
+
+### 3) Potential Colony Count Outliers
+
+This check looks for stony coral counts that are \>200 as potential outliers.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results4.3 <- cdr %>%
+  filter(StonyCoralCount_1 >= 200 | StonyCoralCount_2 >= 200) %>%
+  select(TripName, Purpose, Project, Park, Site, Transect, StonyCoralCount_1, StonyCoralCount_2)
+
+WriteDataTable(QC_results4.3)
+```
+
+------------------------------------------------------------------------
+
+### 4) Stony Coral Counts Equal to Zero
+
+This check looks for stony coral counts equal to zero.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+
+QC_results4.4 <- cdr %>%
+  filter(StonyCoralCount_1 == 0 | StonyCoralCount_2 == 0) %>%
+  select(TripName, Purpose, Project, Park, Site, Transect, StonyCoralCount_1, StonyCoralCount_2)
+
+WriteDataTable(QC_results4.4)
+```
+
+------------------------------------------------------------------------
+
+### 5) Potential Rugosity Outliers
+
+Look for rugosity \>26 for review.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results4.5 <- cdr %>%
+  filter(Rugosity_m > 26) %>%
+  select(TripName, Purpose, Project, Park, Site, Transect, StonyCoralCount_1, Rugosity_m)
+
+WriteDataTable(QC_results4.5)
+```
+
+------------------------------------------------------------------------
+
+### 6) Highly Variable Colony Counts
+
+Look for situations where the ratio of stony coral counts is >1.9.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results4.6 <- cdr %>%
+  mutate(Ratio = format(ifelse(StonyCoralCount_1 > StonyCoralCount_2, abs(StonyCoralCount_1/StonyCoralCount_2), abs(StonyCoralCount_2/StonyCoralCount_1)),digits = 2)) %>%
+  rename(Count_1 = StonyCoralCount_1) %>%
+  rename(Count_2 = StonyCoralCount_2) %>%
+  select(TripName, Purpose, Project, Park, Site, Transect, Count_1, Count_2, Ratio) %>%
+  filter(Ratio >= 1.9)
+
+WriteDataTable(QC_results4.6)
+```
+
+------------------------------------------------------------------------
+
+### 7) Potential Fire Coral Outliers
+
+This check looks for fire coral counts that are potential outliers. This check calculates the interquartile range (IQR). Outliers are values below Q1 - (1.5 x IQR) and Q3 + (1.5 x IQR).
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results4.7 <- cdr %>%
+  filter(!is.na(FireCoralCount_1)) %>%
+  filter(FireCoralCount_1 > 0) %>%
+  select(TripName,Project,Purpose,Park,Site,Transect,FireCoralCount_1,FireCoralCount_2)
+
+#calculate statistical outliers: below Q1-(1.5)IQR or above Q3+(1.5)IQR
+Q <- quantile(QC_results4.7$FireCoralCount_1, probs=c(.25, .75), na.rm = FALSE)
+iqr <- IQR(QC_results4.7$FireCoralCount_1)
+up <-  Q[2]+1.5*iqr # Upper Range  
+low<- Q[1]-1.5*iqr # Lower Range
+
+#filter on the low and high
+QC_results4.7 <- QC_results4.7 %>%
+  filter(FireCoralCount_1 > up | FireCoralCount_1 < low)
+
+#clean up a few objects we no longer need
+remove(up,low,iqr,Q)
+
+WriteDataTable(QC_results4.7)
+```
+
+------------------------------------------------------------------------
+
+### 8) Fire Coral Counts Equal to Zero
+
+This check looks for records where the fire coral count is zero.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+
+QC_results4.8 <- cdr %>%
+  filter(FireCoralCount_1 == 0 | FireCoralCount_2 == 0) %>%
+  select(TripName, Purpose, Project, Park, Site, Transect, FireCoralCount_1, FireCoralCount_2)
+
+WriteDataTable(QC_results4.8)
+```
+
+------------------------------------------------------------------------
+
+### 9) Unverified CDR Entries
+
+This check looks for CDR entries that have not been marked as verified in the database.
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+QC_results4.9 <- cdr %>%
+  filter(is.na(Verifier) | is.na(VerifiedDate)) %>%
+  select(TripName,Project,Site,Transect,Verifier,VerifiedDate) %>%
+  distinct()
+  
+WriteDataTable(QC_results4.9)
+```
+
+------------------------------------------------------------------------
+
+### 10) Schedule Rugosity Soon
+
+This informational check calculates when the last rugosity measurement was recorded for a transect, and any greater than 3.5 years are displayed here. A few retired sites are no longer being visited and have been excluded (WSG, BKN, I33, I63, O12, O27, and O92).
+
+```{r, echo = FALSE, warning = FALSE, message = FALSE, results='asis'}
+
+cdr$StartDate <- as.Date(cdr$StartDate, format = "%m/%d/%Y")
+
+QC_results4.10 <- cdr %>%
+  filter(Project == "CoralVideo") %>%
+  filter(Site != "BKN", Site != "WSG", Site != "I33", Site != "I63", Site != "O12", Site != "O27", Site != "O92") %>%
+  select(Park,Site,Transect,Rugosity_m,StartDate) %>%
+  filter(!is.na(Rugosity_m)) %>%
+  mutate(ParkSiteTransect = paste0(Park,Site,Transect)) %>%
+  group_by(Park,Site,Transect) %>%
+  mutate(LastRugosityDate = max(StartDate)) %>%
+  select(ParkSiteTransect,LastRugosityDate) %>%
+  distinct() %>%
+  select(-ParkSiteTransect) %>%
+  distinct()
+
+#Summarize transects down to one row per site
+Summary_rugosity <- as.data.table(QC_results4.10)[, toString(Transect), by = list(Park, Site, LastRugosityDate)] %>%
+  mutate(YearsElapsed = time_length(difftime(Sys.time(), LastRugosityDate),"years")) %>%
+  rename(Transects = V1) %>%
+  filter(YearsElapsed > 3.5) %>%
+  select(Park,Site,Transects,LastRugosityDate,YearsElapsed) %>%
+  arrange(desc(YearsElapsed))
+
+WriteDataTable(Summary_rugosity)
+```
